@@ -1,12 +1,16 @@
 import cv2
 import numpy as np
 from pymavlink import mavutil
+import math
 
 # MAVLink bağlantısını başlat (SITL simülasyonu için Mission Planner UDP portunu kullanın)
 master = mavutil.mavlink_connection('udp:127.0.0.1:14552')
 
 # Video yakalama (webcam)
 cap = cv2.VideoCapture(0)
+
+# Stabilite kontrolü için hata büyüklüğü eşik değeri
+mode_switch_stability_threshold = 100  # Bu değeri ihtiyacınıza göre ayarlayın
 
 while True:
     ret, frame = cap.read()
@@ -36,6 +40,10 @@ while True:
     # Kontur tespiti
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    fire_detected = False
+    visual_roll = 0
+    visual_pitch = 0
+
     if contours:
         # En büyük konturu seç
         c = max(contours, key=cv2.contourArea)
@@ -59,57 +67,54 @@ while True:
             frame_center_y = frame.shape[0] // 2
 
             # Hata (error) değerini hesaplama: kırmızı alan ile görüntü merkezi arasındaki fark
-            error_x = cx - frame_center_x
-            error_y = cy - frame_center_y
+            error_x_visual = cx - frame_center_x
+            error_y_visual = cy - frame_center_y
 
-            # Hata değerlerini kullanarak roll ve pitch hesaplama (ölçeklendirme ayarlanabilir)
-            roll = int(np.clip(error_x, -500, 500))
-            pitch = int(np.clip(error_y, -500, 500))
+            # Görsel hata değerlerini RC komutlarına dönüştür (ölçeklendirme doğrudan aktarılıyor; ayarlanabilir)
+            visual_roll = int(np.clip(error_x_visual, -500, 500))
+            visual_pitch = int(np.clip(error_y_visual, -500, 500))
 
-            # Görüntü üzerinde hata bilgilerini çizdirme
-            cv2.line(frame, (frame_center_x, frame_center_y), (cx, cy), (255, 255, 0), 2)
-            cv2.putText(frame, f"Error: ({error_x}, {error_y})", (10, 60),
+            cv2.putText(frame, f"Fire Detected! Visual Err: ({error_x_visual}, {error_y_visual})", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            fire_detected = True
 
-            print(f"Error: ({error_x}, {error_y}), Roll: {roll}, Pitch: {pitch}")
+            # Ek olarak, görsel hata büyüklüğünü hesaplayıp stabilite kontrolü yapalım
+            error_magnitude = math.sqrt(error_x_visual**2 + error_y_visual**2)
+            if error_magnitude > mode_switch_stability_threshold:
+                cv2.putText(frame, "Stability Low - No Mode Change", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                print("Düşük stabilite: Mod değişikliği uygulanmadı.")
+                fire_detected = False  # Stabil değilse görsel mod değişikliği yapılmaz
 
-            # Yangın alanının genişliğine göre uçuş modunu belirleme
-            # Örneğin, radius < 50 ise dar alan yangını (dikey mod), >= 50 ise geniş alan yangını (sabit kanat modu)
-            if radius < 50:
-                cv2.putText(frame, "VTOL: Vertical Mode", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                print("Dar alan yangını tespit edildi: Dikey moda geçiliyor.")
-                master.mav.command_long_send(
-                    master.target_system, master.target_component,
-                    mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION,
-                    0,    # Confirmation
-                    0,    # 0: Dikey (hover) mod
-                    0, 0, 0, 0, 0, 0, 0)
-            else:
-                cv2.putText(frame, "VTOL: Fixed Wing Mode", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                print("Geniş alan yangını tespit edildi: Sabit kanat moduna geçiliyor.")
-                master.mav.command_long_send(
-                    master.target_system, master.target_component,
-                    mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION,
-                    0,    # Confirmation
-                    1,    # 1: Sabit kanat modu
-                    0, 0, 0, 0, 0, 0, 0)
+    # Eğer görsel mod değişikliği uygulanamazsa, o zaman global (GPS) veriler veya nötr komutlar kullanılır.
+    # (Burada GPS verileri kullanılmıyor; yalnızca görüntü işleme bazlı kontrol mevcut)
 
-            # RC override komutları gönderme (roll ve pitch hatalarına göre)
-            master.mav.rc_channels_override_send(
-                master.target_system, master.target_component,
-                1500 + roll,   # Roll kanalı
-                1500 + pitch,  # Pitch kanalı
-                1500,          # Throttle
-                1500,          # Yaw veya diğer kanal
-                0, 0, 0, 0)
+    # --- MAVLink üzerinden RC override komutlarının gönderilmesi ---
+    # Her kanal için nötr referans değeri 1500; üzerine eklenen ofsetler kontrol komutlarını belirler.
+    if fire_detected:
+        mode = "Visual Override"
+        control_roll = visual_roll
+        control_pitch = visual_pitch
+    else:
+        mode = "No Mode Change"
+        control_roll = 0
+        control_pitch = 0
+
+    cv2.putText(frame, f"Mode: {mode}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    print(f"Control: Roll: {control_roll}, Pitch: {control_pitch}, Mode: {mode}")
+
+    master.mav.rc_channels_override_send(
+        master.target_system, master.target_component,
+        1500 + control_roll,   # Roll kanalı
+        1500 + control_pitch,  # Pitch kanalı
+        1500,                  # Throttle
+        1500,                  # Yaw veya diğer kanal
+        0, 0, 0, 0
+    )
 
     # Görüntü ve maske pencerelerini göster
     cv2.imshow("Frame", frame)
     cv2.imshow("Mask", mask)
-
-    # ESC tuşuna basılırsa çıkış yap
     if cv2.waitKey(1) & 0xFF == 27:
         break
 
