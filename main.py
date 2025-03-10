@@ -4,7 +4,7 @@ from pymavlink import mavutil
 import math
 import time
 
-# MAVLink bağlantısını başlat (SITL simülasyonu veya gerçek uçuş kartı için uygun port)
+# MAVLink bağlantısını başlat (SITL veya gerçek uçuş kartı için uygun port)
 master = mavutil.mavlink_connection('udp:127.0.0.1:14552')
 print("Heartbeat bekleniyor...")
 master.wait_heartbeat()
@@ -13,10 +13,9 @@ print("Heartbeat alındı, MAVLink bağlantısı kuruldu.")
 # Video yakalama (webcam)
 cap = cv2.VideoCapture(0)
 
-# Print işlemleri için zaman kontrolü
-last_print_time = time.time()
+# Düzeltme için hata büyüklüğü eşik değeri (pixel cinsinden)
+correction_threshold = 30
 
-# Döngü
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -25,17 +24,10 @@ while True:
     # Görüntüyü HSV renk uzayına çevir
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
-    # Kırmızı renk için iki farklı HSV aralığını tanımla
-    lower_red1 = np.array([0, 100, 100])
-    upper_red1 = np.array([10, 255, 255])
-    mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
-
-    lower_red2 = np.array([160, 100, 100])
-    upper_red2 = np.array([180, 255, 255])
-    mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
-
-    # Maskeleri birleştir
-    mask = cv2.bitwise_or(mask1, mask2)
+    # Sarı renk için HSV aralığını tanımla
+    lower_yellow = np.array([20, 100, 100])
+    upper_yellow = np.array([30, 255, 255])
+    mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
     # Gürültüyü azaltmak için morfolojik işlemler
     kernel = np.ones((5, 5), np.uint8)
@@ -48,7 +40,7 @@ while True:
     # Varsayılan kontrol değerleri
     control_roll = 0
     control_pitch = 0
-    mode = "Mission Planner Route"  # Varsayılan mod: override yapılmıyor
+    mode = "Mission Planner Route"  # Varsayılan: mevcut rota korunuyor
 
     if contours:
         # En büyük konturu seç
@@ -57,7 +49,7 @@ while True:
 
         if radius < 10:
             mode = "No Override"
-            # Eğer yangın alanı çok küçükse override yapılmıyor
+            print("Sarı bölge çok küçük (radius < 10): Override yapılmıyor.")
         else:
             # Konturun merkezini hesapla
             M = cv2.moments(c)
@@ -75,11 +67,9 @@ while True:
             frame_center_x = frame.shape[1] // 2
             frame_center_y = frame.shape[0] // 2
             
-            # Görsel hata: hedef ile görüntü merkezi arasındaki fark
+            # Görsel hata (error): Tespit edilen alan ile görüntü merkezi arasındaki fark
             error_x = cx - frame_center_x
             error_y = cy - frame_center_y
-            
-            # Hata değerlerini kullanarak RC override ofsetlerini hesapla
             visual_roll = int(np.clip(error_x, -500, 500))
             visual_pitch = int(np.clip(error_y, -500, 500))
             
@@ -87,30 +77,39 @@ while True:
             cv2.putText(frame, f"Visual Err: ({error_x}, {error_y})", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            # VTOL modunun belirlenmesi: yarıçap aralıklarına göre
-            if radius < 50:
-                mode = "VTOL Vertical Mode"
-                master.mav.command_long_send(
-                    master.target_system, master.target_component,
-                    mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION,
-                    0, 0, 0, 0, 0, 0, 0, 0)
-            else:
-                mode = "VTOL Fixed Wing Mode"
-                master.mav.command_long_send(
-                    master.target_system, master.target_component,
-                    mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION,
-                    0, 1, 0, 0, 0, 0, 0, 0)
+            # Hata büyüklüğü
+            error_magnitude = math.sqrt(error_x**2 + error_y**2)
             
-            control_roll = visual_roll
-            control_pitch = visual_pitch
+            # İlk adım: Uçağı düzeltme
+            if error_magnitude > correction_threshold:
+                mode = "Correcting Orientation"
+                control_roll = visual_roll
+                control_pitch = visual_pitch
+                print(f"Orientasyon düzeltiliyor, hata büyüklüğü: {error_magnitude:.1f} > {correction_threshold}")
+            else:
+                # Uçak düz olduktan sonra VTOL modunu belirleme
+                if radius < 50:
+                    mode = "VTOL Vertical Mode"
+                    print("Uçak düz: VTOL dikey moda geçiliyor (radius < 50).")
+                    master.mav.command_long_send(
+                        master.target_system, master.target_component,
+                        mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION,
+                        0,  # Confirmation
+                        0,  # 0: Dikey (hover) mod
+                        0, 0, 0, 0, 0, 0, 0)
+                else:
+                    mode = "VTOL Fixed Wing Mode"
+                    print("Uçak düz: VTOL sabit kanat moduna geçiliyor (radius >= 50).")
+                    master.mav.command_long_send(
+                        master.target_system, master.target_component,
+                        mavutil.mavlink.MAV_CMD_DO_VTOL_TRANSITION,
+                        0,  # Confirmation
+                        1,  # 1: Sabit kanat modu
+                        0, 0, 0, 0, 0, 0, 0)
+                control_roll = 0
+                control_pitch = 0
 
-    # 3 saniye aralığında print yapmak için zaman kontrolü
-    current_time = time.time()
-    if current_time - last_print_time >= 3:
-        print(f"Control: Roll offset: {control_roll}, Pitch offset: {control_pitch}, Mode: {mode}")
-        last_print_time = current_time
-
-    # MAVLink üzerinden RC override komutlarının gönderilmesi
+    cv2.putText(frame, f"Mode: {mode}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     master.mav.rc_channels_override_send(
         master.target_system, master.target_component,
         1500 + control_roll,   # Roll kanalı
@@ -120,7 +119,6 @@ while True:
         0, 0, 0, 0
     )
 
-    # Görüntü ve maske pencerelerini göster
     cv2.imshow("Frame", frame)
     cv2.imshow("Mask", mask)
     if cv2.waitKey(1) & 0xFF == 27:
